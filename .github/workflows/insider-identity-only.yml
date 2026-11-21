@@ -1,0 +1,73 @@
+name: Check Insider identity only
+on:
+  push:
+    branches: [test/insider-identity-7031]
+
+permissions: {}
+
+jobs:
+  identity:
+    name: Read Insider identity and smoke policy
+    if: >-
+      github.repository_id == '917984316' &&
+      github.repository == 'hexf00/git-workflow-test' &&
+      github.ref == 'refs/heads/test/insider-identity-7031' &&
+      github.event.created && !github.event.deleted &&
+      github.actor == 'hexf00' &&
+      github.triggering_actor == 'hexf00' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    environment: insider-smoke
+    steps:
+      - name: Read whoami and exact package policy; no publishing
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          const origin = 'https://insider-npm-registry.univer.work';
+          const name = '@hexf00/release-actions-smoke';
+          const token = process.env.NPM_TOKEN;
+          let failure = 'unverified';
+          try {
+            failure = 'environment secret unavailable';
+            if (!token) throw Error();
+            failure = 'credential is not an npm-provider token';
+            if (!token.startsWith('npm_')) throw Error();
+            failure = 'identity endpoint unavailable';
+            const call = (path, headers) => fetch(origin + path, {
+              method: 'GET', headers, redirect: 'error', signal: AbortSignal.timeout(10000)
+            });
+            const who = await call('/-/whoami', { authorization: 'Bearer ' + token });
+            failure = 'identity endpoint rejected the credential (HTTP ' + who.status + ')';
+            if (!who.ok) throw Error();
+            failure = 'identity response not accepted';
+            const identity = (await who.json()).username;
+            if (!/^npm:[a-z0-9][a-z0-9_-]{0,63}$/.test(identity ?? '')) throw Error();
+
+            failure = 'public policy unavailable';
+            const policy = await call('/-/insider/v1/policy');
+            if (!policy.ok) throw Error();
+            failure = 'public policy response not accepted';
+            const data = await policy.json();
+            const configured = data?.packages?.[name];
+            const identities = configured?.authority?.insiderIdentities;
+            if (!Array.isArray(identities) ||
+              !Array.isArray(configured?.tags?.promoted?.publish) ||
+              !data.scopes || typeof data.scopes !== 'object') throw Error();
+            const exact = identities.includes(identity) &&
+              JSON.stringify(configured.tags.promoted.publish) === '[["allow",{}]]';
+            const otherGrants = [
+              ...Object.entries(data.packages), ...Object.entries(data.scopes),
+            ].filter(([key, entry]) =>
+              key !== name && entry?.authority?.insiderIdentities?.includes(identity)).length;
+            console.log('Verified Insider identity: ' + identity);
+            console.log('Allowed by current smoke package promoted policy: ' + exact);
+            console.log('Identity appears in other explicit Insider policies: ' + (otherGrants > 0));
+          } catch {
+            console.error('Insider identity check stopped: ' + failure);
+            process.exitCode = 1;
+          }
+          JS
